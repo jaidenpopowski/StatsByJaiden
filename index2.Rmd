@@ -1,0 +1,270 @@
+---
+title: "Stats By Jaiden"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+---
+
+```{r setup, include=FALSE, warning=F}
+## Global options
+knitr::opts_chunk$set(cache = TRUE)
+library(tidyverse) # data manipulation tools
+library(fitzRoy) # fetch AFL data
+library(gt) # table outputs
+library(gtExtras) # fancy table addons
+library(readxl) # reading excel files
+library(ggrepel) # labeled graph points
+library(devtools) # advanced use for GitHub integration
+library(rvest) # web scraping
+library(markdown) # creating blog
+library(prettydoc) # theme
+library(tweetrmd) # adding Tweets into RMarkdown
+
+sc_stats <- readRDS("All_SC_Stats.rds")
+
+supercoach_scoring_system <- read_excel("~/supercoach scoring system.xlsx") # SuperCoach scoring from terms and conditions
+
+images <- readRDS("PlayerImages.rds") %>% 
+  mutate(img = str_replace(img,"2022014","2023014"))
+
+model_plot <- function(x, xvar, yvar, xlab, title) {
+  
+  ysym <- rlang::ensym(yvar)
+  xsym <- rlang::ensym(xvar)
+  mae <- x %>% transmute(diff = abs({{xvar}}-{{yvar}}), mean = mean(diff)) %>% pull(mean) %>% unique()
+
+  
+  ggplot(x, aes(x={{xvar}},y={{yvar}})) +
+    geom_point(alpha=0.2) +
+    geom_abline(color = "blue") +
+    labs(x=xlab,y="Actual SuperCoach Score",
+         title = title,
+         subtitle = paste0("R-squared (% of variation explained): ",round(100*summary(rlang::inject( lm(!!ysym ~ 0+!!xsym, data=x) ))$r.squared,1),"%","     MAE: ",round(mae,2)))+
+    theme_minimal()
+}
+```
+
+# The secrets of SuperCoach AFL scoring
+
+
+I've always been intrigued by the **AFL SuperCoach** game. Players' scores are determined by a variety of playing statistics for each game, but we don't really have any idea what is included. *Effective disposals? Uncontested intercept marks? Gathers from hitouts?* There are so many statistical categories that some coaches think players magically get points! There is also points scaling by time in the game and how close it is, along with each game only compromising of **3300** total points.
+
+Unlocking the secrets behind how SuperCoach is scored will give better insights to the community and help with player selection. Explaining the scoring will help answer how certain players achieve high averages, what stats are important to be good at, and who gets the biggest bonuses.
+
+This is my first blog post so make sure you share if you enjoy! Let's try and reverse engineer SuperCoach!
+
+## What we know about scoring
+From the SuperCoach T&C's in 2023, we have the following scoring breakdown:
+```{r,echo=F, fig.align='center'}
+supercoach_scoring_system %>% 
+  select(1,2) %>% 
+  gt()
+```
+
+As these are the official terms & conditions it is hard to add anything else in with direct certainty. Each year a SC scoring system article is posted, but it is essentially the same every year (except for a few rewordings). These articles contain more stats that supposedly have values but aren't included in the T&Cs:
+
+> "There are more than 50 statistical categories that count towards every player’s score.
+>  ... long kicks are worth more than short kicks ... a sharked hitout is valued at -1.
+> And you really don’t want any of your players giving away a 50m penalty – that’s a whopping 8.5 points off a player’s total."
+>
+> `r tufte::quote_footer('--- KFC SuperCoach beginner’s guide: How players score points, scoring system explained - Al Paton 06/02/2023 via FOXFOOTY.')`
+
+<p style="text-align: right;size=10">
+    <a href="https://www.foxsports.com.au/afl/supercoach-news/kfc-supercoach-beginners-guide-how-players-score-points-scoring-system-explained/news-story/ddbe3143e74da1ed510cfc6b46253c74">Read the quoted article here.</a>
+</p>
+
+As the article has some inconsistencies, I'll use the T&Cs from now on as they are a complete list.
+
+This is a good start but there are three main problems - where the analysis of scoring breaks down:
+
+1. These stats are too complex and can't be viewed on the AFL website.
+2. We haven't accounted for scaling.
+3. We haven't accounted for late-game heroics boosts.
+I'll attempt to address these points while tracking how close we are to solving the formula.
+
+# 1. Using the AFL website stats
+Let's start with the default stats available on the AFL website. Of the SuperCoach score categories we can see:
+
+* Effective kicks
+* Effective handballs (Effective Disposals - Effective Kicks)
+* Clangers
+* Hardball get/loose ball get (Contested Possessions - Contested Marks - Frees For)
+* Goals
+* Behinds
+* Contested marks
+* Uncontested marks (Marks - Contested marks)
+* Tackles
+* Free Kicks
+
+Here is an example of these stats exclusively, via the My Stats option on the AFL website.
+![AFL Website Stats Example](websiteexample.png)
+
+Calculating scores using these stats and their respective point values we achieve this:
+```{r, warning = F}
+sc_stats %>% 
+  rowwise() %>%
+  mutate(SC_Prediction = sum(
+    4 * effective_kicks,
+    -4 * clangers,
+    1.5 * (effective_handballs), # effective handballs
+    4.5 * (contested_possessions - contested_marks - frees_for), # loose/hard ball gets
+    2 * (marks-contested_marks), # uncontested marks
+    6 * contested_marks,
+    4 * tackles,
+    4 * frees_for,
+    -4 * frees_against,
+    5 * hitouts_adv # hitouts to advantage
+    )) %>%
+  ungroup() %>%
+  model_plot(SC_Prediction, Score, "SuperCoach prediction", "SuperCoach score estimation using AFL website stats")
+```
+
+I've introduced two metrics here to measure how accurate our predictions are.
+1. R-squared, which measures how much variation in the actual scores can be explained by our predictions.
+2. MAE, mean absolute error, which is the average difference between our predictions and the actual scores.
+
+While an r-squared value of 96.3% might seem really good, the MAE tells us that on average, our predictions are 11.61 points off. Not very useful yet! It appears that middle scores are being overestimated and most huge scores are being underestimated.
+
+Comparatively, using these basic stats isn't even as good as using AFL Fantasy points!
+```{r, echo=FALSE}
+model_plot(sc_stats, dreamTeamPoints, Score, "AFL Fantasy Score", "SuperCoach score vs AFL Fantasy score")
+```
+
+## 2. Using advanced stats
+We are missing quite a few stats that are directly accessible on the AFL website. I've managed to join together different player stats sources we can fill out the full list of stats available in the T&Cs. Let's take a look at what stats we have now:
+```{r, echo = FALSE}
+sc_stats %>% 
+  transmute(
+    season,
+    round,
+    player,
+    team = playing_for,
+    effective_kicks,
+    ineffective_kicks = kicks - effective_kicks - clanger_kick,
+    clanger_kicks = clanger_kick,
+    effective_handballs,
+    ineffective_handballs = handballs - effective_handballs - clanger_handball,
+    clanger_handballs = clanger_handball,
+    handball_receives = handball_received,
+    hard_ball_gets = hard_ball_get,
+    loose_ball_gets = loose_ball_get,
+    goals,
+    behinds,
+    uncontested_marks,
+    uncontested_intercept_marks = uncontested_intercept_mark,
+    contested_marks,
+    contested_intercept_marks = contested_intercept_mark,
+    tackles,
+    frees_for,
+    frees_against,
+    hitouts_to_advantage = hitouts_adv,
+    gathers_from_hitout = gather_from_hitout,
+    sc_score = Score
+  ) %>% arrange(desc(sc_score)) %>% str()
+```
+
+This is directly matching the scoring system outlined by the T&Cs! The most exciting thing about this dataset is that we can see where players score their points and how well they do before scaling points.
+
+```{r}
+sc_stats %>% 
+  rowwise() %>% 
+  mutate(SumScore = sum(
+    4*effective_kicks, -4*clangers, 1.5*effective_handballs, 1.5*handball_received, 4.5*hard_ball_get, 4.5*loose_ball_get, 8*goals, 1*behinds, 
+    2*(uncontested_marks - uncontested_intercept_mark), 6*(contested_marks - contested_intercept_mark), 4*uncontested_intercept_mark,
+    8*contested_intercept_mark, 4*tackles, 4*frees_for, -4*frees_against, 5*hitouts_adv, 2*gather_from_hitout, na.rm = T
+  )) %>% 
+  ungroup() %>% 
+  model_plot(xvar = SumScore, yvar = Score, xlab = "Advanced Stats Prediction", title = "SuperCoach score vs advanced stats estimation")
+```
+
+We are up at 98% of variation explained and the MAE dropped. Still not perfect, but we are making progress! We still haven't addressed the higher scores being underestimated. Scaling should help with this!
+
+## 3. Scaling the scores via the 3300 rule
+
+If you weren't aware, SuperCoach AFL has a set value for total points in a game. Based on the predictions from before, the estimated number of games that hit this value is 93.7%, with the game average at 3582. If this is close to correct, then scaling our predicitons will help a lot.
+
+I'll be scaling each score linearly to 3300, but I think there might be other ways that could work. I've heard that stats are scaled quarterly but that also goes against the whole 'every game is equal' argument. Teams could only win one quarter and still get 4 premiership points.
+
+Let's see how the scaling affects our scores:
+```{r, echo = FALSE}
+sc_stats %>% 
+  rowwise() %>% 
+  mutate(SumScore = sum(
+    4*effective_kicks, -4*clangers, 1.5*effective_handballs, 1.5*handball_received, 4.5*hard_ball_get, 4.5*loose_ball_get, 8*goals, 1*behinds, 
+    2*(uncontested_marks - uncontested_intercept_mark), 6*(contested_marks - contested_intercept_mark), 4*uncontested_intercept_mark,
+    8*contested_intercept_mark, 4*tackles, 4*frees_for, -4*frees_against, 5*hitouts_adv, 2*gather_from_hitout, na.rm = T
+  )) %>% 
+  ungroup() %>% 
+  group_by(match_id) %>% 
+  mutate(Total = sum(SumScore),SumScoreScaled = 3300*SumScore/sum(SumScore,na.rm=T)) %>% 
+  ungroup() %>% 
+  model_plot(SumScoreScaled, Score, xlab = 'Scaled Prediction', title = "SuperCoach points vs Scaled Estimations")
+```
+
+Awesome! The MAE is now single digits, which is the best I can get it to with what I have access to. So on average, the estimations are 8.27 points different to the actual scores. Let's see who has the biggest differences:
+```{r}
+sc_stats %>% 
+  rowwise() %>% 
+  mutate(SumScore = sum(
+    4*effective_kicks, -4*clangers, 1.5*effective_handballs, 1.5*handball_received, 4.5*hard_ball_get, 4.5*loose_ball_get, 8*goals, 1*behinds, 
+    2*(uncontested_marks - uncontested_intercept_mark), 6*(contested_marks - contested_intercept_mark), 4*uncontested_intercept_mark,
+    8*contested_intercept_mark, 4*tackles, 4*frees_for, -4*frees_against, 5*hitouts_adv, 2*gather_from_hitout, na.rm = T
+  )) %>% 
+  ungroup() %>% 
+  group_by(match_id) %>% 
+  mutate(Total = sum(SumScore),SumScoreScaled = 3300*SumScore/sum(SumScore,na.rm=T)) %>% 
+  ungroup() %>% 
+  mutate(diff = SumScore - Score, diffscaled = SumScoreScaled - Score, meandiff = mean(abs(diff)), meandiffscaled = mean(abs(diffscaled))) %>%
+  group_by(id,player) %>% 
+  summarise(
+    games = n(),
+    average = mean(Score),
+    averagepd = mean(SumScore),
+    averagescaled = mean(SumScoreScaled),
+    diff = average - averagescaled,
+    .groups = 'drop'
+  ) %>% arrange((diff)) %>% filter(games>=10) %>% 
+  slice_head(n=7) %>% 
+  left_join(images, by = "id") %>% 
+  transmute(img, Player = player, `Games`=games,`2YR SC Average`=round(average,1),`2YR Estimation` = round(averagescaled,1),Diff = round(abs(average-averagescaled),1)) %>% 
+  gt() %>% 
+  tab_header(title = md("**Most overestimated players**"),subtitle = "Home & Away matches from 2021-2022") %>% 
+  cols_label(img = "") %>% 
+  gt_img_rows(columns = 1, img_source = 'web',height = 80)
+```
+
+Seems like the Rucks are being overestimated the most. There must be some extra stats in the ruck department (sharked hitouts would be one) that bring down ruck scores.
+
+```{r, echo=FALSE}
+sc_stats %>% 
+  rowwise() %>% 
+  mutate(SumScore = sum(
+    4*effective_kicks, -4*clangers, 1.5*effective_handballs, 1.5*handball_received, 4.5*hard_ball_get, 4.5*loose_ball_get, 8*goals, 1*behinds, 
+    2*(uncontested_marks - uncontested_intercept_mark), 6*(contested_marks - contested_intercept_mark), 4*uncontested_intercept_mark,
+    8*contested_intercept_mark, 4*tackles, 4*frees_for, -4*frees_against, 5*hitouts_adv, 2*gather_from_hitout, na.rm = T
+  )) %>% 
+  ungroup() %>% 
+  group_by(match_id) %>% 
+  mutate(Total = sum(SumScore),SumScoreScaled = 3300*SumScore/sum(SumScore,na.rm=T)) %>% 
+  ungroup() %>% 
+  mutate(diff = SumScore - Score, diffscaled = SumScoreScaled - Score, meandiff = mean(abs(diff)), meandiffscaled = mean(abs(diffscaled))) %>%
+  group_by(id,player) %>% 
+  summarise(
+    games = n(),
+    average = mean(Score),
+    averagepd = mean(SumScore),
+    averagescaled = mean(SumScoreScaled),
+    diff = average - averagescaled,
+    .groups = 'drop'
+  ) %>% arrange(desc(diff)) %>% filter(games>=10) %>% 
+  slice_head(n=7) %>% 
+  left_join(images, by = "id") %>% 
+  transmute(img, Player = player, `Games`=games,`2YR SC Average`=round(average,1),`2YR Estimation` = round(averagescaled,1),Diff = round(abs(average-averagescaled),1)) %>% 
+  gt() %>% 
+  tab_header(title = md("**Most underestimated players**"),subtitle = "Home & Away matches from 2021-2022") %>%
+  cols_label(img = "") %>% 
+  gt_img_rows(columns = 1, img_source = 'web',height = 80)
+```
+
+The key position players are being underestimated by the estimations. I think this is because they are more likely to have an influence on the outcome of a game via scoring/defending.
